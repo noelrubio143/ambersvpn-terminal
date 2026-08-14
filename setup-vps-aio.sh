@@ -44,8 +44,8 @@ if [[ -z "$SERVER_IP" ]]; then
 fi
 echo "Detected public IP: ${SERVER_IP}"
 
-VLESS_WS_PATH="/$(tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
-TROJAN_WS_PATH="/$(tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
+VLESS_WS_PATH="/$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
+TROJAN_WS_PATH="/$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
 TTYD_PORT=7681
 NGINX_TLS_PORT=8443   # internal only — sslh sits in front of public 443
 
@@ -112,7 +112,7 @@ TROJAN_CLIENTS_JSON="[]"
 
 for i in $(seq 1 "$NUM_CLIENTS"); do
   UUID=$(cat /proc/sys/kernel/random/uuid)
-  TROJAN_PW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+  TROJAN_PW=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
   LABEL="device${i}"
 
   VLESS_CLIENTS_JSON=$(echo "$VLESS_CLIENTS_JSON" | jq --arg id "$UUID" --arg label "$LABEL" \
@@ -284,7 +284,7 @@ xray_add() {
     return
   fi
   UUID=$(cat /proc/sys/kernel/random/uuid)
-  TPW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+  TPW=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
 
   jq --arg id "$UUID" --arg label "$LABEL" \
     '.inbounds[0].settings.clients += [{"id": $id, "level": 0, "email": $label}]' \
@@ -339,7 +339,7 @@ ssh_add() {
   read -rsp "SSH password (leave blank to auto-generate): " SPASS
   echo ""
   if [[ -z "$SPASS" ]]; then
-    SPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+    SPASS=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
   fi
   useradd -m -s /bin/false "$SUSER"
   echo "${SUSER}:${SPASS}" | chpasswd
