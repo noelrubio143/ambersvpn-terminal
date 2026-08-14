@@ -1,4 +1,3 @@
-cat > setup-vps-aio.sh << 'SCRIPT_EOF'
 #!/usr/bin/env bash
 #
 # setup-vps-aio.sh  (All-In-One)
@@ -481,4 +480,3 @@ echo ""
 echo "Full client data saved at: /usr/local/etc/xray/clients.json (keep private)"
 echo ""
 echo "From now on, add/delete Xray and SSH accounts anytime with: sudo vps-menu"
-SCRIPT_EOF
