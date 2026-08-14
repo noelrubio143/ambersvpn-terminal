@@ -1,3 +1,4 @@
+cat > setup-vps-aio.sh << 'SCRIPT_EOF'
 #!/usr/bin/env bash
 #
 # setup-vps-aio.sh  (All-In-One)
@@ -90,12 +91,12 @@ systemctl enable ttyd
 systemctl restart ttyd
 
 echo "=== 3. BBR congestion control ==="
-cat >> /etc/sysctl.conf <<'EOF'
+cat >> /etc/sysctl.conf <<'EOF2'
 
 # BBR congestion control
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-EOF
+EOF2
 sysctl -p
 CURRENT_CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
 
@@ -226,12 +227,6 @@ echo "<h1>It works.</h1>" > /var/www/html/index.html
 nginx -t && systemctl restart nginx
 
 echo "=== 8. SSH reachable on 22, 80, and 443 ==="
-# 22 and 80: sshd listens on both directly (plain SSH protocol works on any port).
-# 443: shared with HTTPS via sslh, which peeks at the first bytes of each connection
-#      and routes real TLS/HTTPS traffic to Nginx (127.0.0.1:${NGINX_TLS_PORT}) and
-#      SSH-looking traffic to sshd (127.0.0.1:22). This is the standard, above-board
-#      way to reach your own server when a network only allows outbound 80/443 —
-#      it does not affect or interact with any carrier/ISP data billing.
 SSHD_CONFIG="/etc/ssh/sshd_config"
 cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
 sed -i '/^Port /d' "$SSHD_CONFIG"
@@ -262,7 +257,6 @@ EOF
 
 cat > /usr/local/bin/vps-menu <<'MENU_EOF'
 #!/usr/bin/env bash
-# Interactive menu: add/delete Xray accounts and add/delete SSH accounts.
 set -euo pipefail
 source /etc/vps-aio/env
 
@@ -404,7 +398,7 @@ MENU_EOF
 chmod +x /usr/local/bin/vps-menu
 
 echo "=== 11. Health check (ttyd + xray + nginx + sslh) ==="
-cat > /usr/local/bin/vps-health-check.sh <<'EOF'
+cat > /usr/local/bin/vps-health-check.sh <<'EOF3'
 #!/usr/bin/env bash
 LOG="/var/log/vps-health.log"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -421,19 +415,19 @@ for svc in xray nginx ttyd sslh; do
     fi
   fi
 done
-EOF
+EOF3
 chmod +x /usr/local/bin/vps-health-check.sh
 
-cat > /etc/systemd/system/vps-health-check.service <<'EOF'
+cat > /etc/systemd/system/vps-health-check.service <<'EOF4'
 [Unit]
 Description=VPS health check (xray/nginx/ttyd/sslh)
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/vps-health-check.sh
-EOF
+EOF4
 
-cat > /etc/systemd/system/vps-health-check.timer <<'EOF'
+cat > /etc/systemd/system/vps-health-check.timer <<'EOF5'
 [Unit]
 Description=Run VPS health check every 2 minutes
 
@@ -443,7 +437,7 @@ OnUnitActiveSec=2min
 
 [Install]
 WantedBy=timers.target
-EOF
+EOF5
 
 systemctl daemon-reload
 systemctl enable --now vps-health-check.timer
@@ -487,3 +481,4 @@ echo ""
 echo "Full client data saved at: /usr/local/etc/xray/clients.json (keep private)"
 echo ""
 echo "From now on, add/delete Xray and SSH accounts anytime with: sudo vps-menu"
+SCRIPT_EOF
