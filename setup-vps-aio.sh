@@ -2,107 +2,59 @@
 #
 # setup-vps-aio.sh  (All-In-One)
 # Unified personal VPS stack on Ubuntu/Debian, all sharing port 443 via Nginx:
-#   - ttyd web terminal          -> https://DOMAIN/terminal/  (WS)
-#   - Xray VLESS+WS+TLS          -> https://DOMAIN/<random>/  (WS)
-#   - Xray Trojan+WS+TLS         -> https://DOMAIN/<random>/  (WS)
-#   - SSH                        -> key-based auth only, separate port 22
-#   - Fail2ban protecting SSH
+#   - ttyd web terminal          -> https://SERVER_IP/terminal/  (WS)
+#   - Xray VLESS+WS+TLS          -> https://SERVER_IP/<random>/  (WS)
+#   - Xray Trojan+WS+TLS         -> https://SERVER_IP/<random>/  (WS)
+#   - SSH                        -> password auth, reachable on ports 22, 80, AND 443
+#                                    (443 is shared with HTTPS via sslh port multiplexing,
+#                                    for use when your own network blocks port 22 outbound)
 #   - BBR congestion control
-#   - systemd timer health check for xray/nginx/ttyd
+#   - systemd timer health check for xray/nginx/ttyd/sslh
+#   - vps-menu: interactive menu to add/delete Xray and SSH accounts
 #
-# This matches the AmberVPN "VPS Terminal" front-end HTML you uploaded:
-# the ttyd path below can be used directly as the "Terminal endpoint".
-#
-# For your own personal use across your own devices. No SlowDNS, no
-# "payload" tooling, no multi-tenant reseller account system.
+# No domain needed. TLS is a self-signed certificate issued for this
+# VPS's public IP address (clients will need to accept/trust it manually,
+# since it isn't from a public CA).
 #
 # Usage:
-#   sudo bash setup-vps-aio.sh yourdomain.example.com "ssh-ed25519 AAAA... you@laptop" [num_xray_clients]
+#   sudo bash setup-vps-aio.sh [num_initial_xray_clients]
 #
-# Example:
-#   sudo bash setup-vps-aio.sh vps.example.com "ssh-ed25519 AAAA..." 2
+# After setup, manage accounts anytime with:
+#   sudo vps-menu
 #
 
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Please run as root (sudo bash $0 <domain> <ssh_public_key> [num_clients])"
+  echo "Please run as root (sudo bash $0 [num_initial_xray_clients])"
   exit 1
 fi
 
-DOMAIN="${1:-}"
-SSH_PUBKEY="${2:-}"
-NUM_CLIENTS="${3:-1}"
+NUM_CLIENTS="${1:-1}"
 
-if [[ -z "$DOMAIN" ]]; then
-  echo "Usage: sudo bash $0 <domain> [ssh_public_key] [num_clients]"
-  echo "  domain must already have a DNS A record pointing to this VPS's IP."
+echo "=== 0. Detecting this VPS's public IP ==="
+SERVER_IP="${SERVER_IP:-}"
+if [[ -z "$SERVER_IP" ]]; then
+  SERVER_IP=$(curl -fsSL4 https://ifconfig.me || curl -fsSL4 https://api.ipify.org)
+fi
+if [[ -z "$SERVER_IP" ]]; then
+  echo "ERROR: Could not auto-detect public IP. Set it manually, e.g.:"
+  echo "  SERVER_IP=1.2.3.4 sudo -E bash $0 [num_initial_xray_clients]"
   exit 1
 fi
+echo "Detected public IP: ${SERVER_IP}"
 
 VLESS_WS_PATH="/$(tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
 TROJAN_WS_PATH="/$(tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
 TTYD_PORT=7681
+NGINX_TLS_PORT=8443   # internal only — sslh sits in front of public 443
 
 echo "=== 1. Updating system ==="
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y curl wget unzip nginx certbot python3-certbot-nginx ufw fail2ban jq build-essential
+apt-get install -y curl wget unzip nginx openssl ufw jq sslh build-essential
 
-echo "=== 2. SSH key-based auth ==="
-REAL_USER="${SUDO_USER:-root}"
-USER_HOME=$(eval echo "~$REAL_USER")
-mkdir -p "$USER_HOME/.ssh"
-chmod 700 "$USER_HOME/.ssh"
-
-if [[ -n "$SSH_PUBKEY" ]]; then
-  echo "$SSH_PUBKEY" >> "$USER_HOME/.ssh/authorized_keys"
-  chmod 600 "$USER_HOME/.ssh/authorized_keys"
-  chown -R "$REAL_USER":"$REAL_USER" "$USER_HOME/.ssh"
-  echo "Added provided public key."
-else
-  echo "WARNING: No SSH public key provided."
-  echo "Add your key to $USER_HOME/.ssh/authorized_keys now, in another session."
-  read -rp "Press Enter once done (or Ctrl+C to abort): "
-fi
-
-if [[ ! -s "$USER_HOME/.ssh/authorized_keys" ]]; then
-  echo "ERROR: No authorized_keys found. Aborting before disabling password auth."
-  exit 1
-fi
-
-SSHD_CONFIG="/etc/ssh/sshd_config"
-cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
-sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$SSHD_CONFIG"
-systemctl restart ssh || systemctl restart sshd
-
-echo "=== 3. Fail2ban for SSH ==="
-cat > /etc/fail2ban/jail.local <<'EOF'
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 3600
-findtime = 600
-EOF
-systemctl enable fail2ban
-systemctl restart fail2ban
-
-echo "=== 4. BBR congestion control ==="
-cat >> /etc/sysctl.conf <<'EOF'
-
-# BBR congestion control
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-sysctl -p
-CURRENT_CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-
-echo "=== 5. Installing ttyd ==="
+echo "=== 2. Installing ttyd ==="
 if ! command -v ttyd >/dev/null 2>&1; then
   TTYD_VERSION="1.7.7"
   ARCH=$(uname -m)
@@ -137,10 +89,20 @@ systemctl daemon-reload
 systemctl enable ttyd
 systemctl restart ttyd
 
-echo "=== 6. Installing Xray-core ==="
+echo "=== 3. BBR congestion control ==="
+cat >> /etc/sysctl.conf <<'EOF'
+
+# BBR congestion control
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+sysctl -p
+CURRENT_CC=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+
+echo "=== 4. Installing Xray-core ==="
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-echo "=== 7. Generating Xray client identities ==="
+echo "=== 5. Generating initial Xray client identities ==="
 mkdir -p /usr/local/etc/xray
 CLIENTS_FILE="/usr/local/etc/xray/clients.json"
 echo "[]" > "$CLIENTS_FILE"
@@ -202,22 +164,24 @@ EOF
 systemctl enable xray
 systemctl restart xray
 
-echo "=== 8. Unified Nginx config: ttyd + VLESS + Trojan, all on 443 ==="
+echo "=== 6. Self-signed TLS certificate for ${SERVER_IP} ==="
+mkdir -p /etc/ssl/vps-aio
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout /etc/ssl/vps-aio/selfsigned.key \
+  -out /etc/ssl/vps-aio/selfsigned.crt \
+  -days 3650 \
+  -subj "/CN=${SERVER_IP}" \
+  -addext "subjectAltName=IP:${SERVER_IP}"
+chmod 600 /etc/ssl/vps-aio/selfsigned.key
+
+echo "=== 7. Nginx (internal TLS on 127.0.0.1:${NGINX_TLS_PORT} — sslh fronts public 443) ==="
 cat > /etc/nginx/sites-available/vps-aio <<EOF
 server {
-    listen 80;
-    server_name ${DOMAIN};
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
+    listen 127.0.0.1:${NGINX_TLS_PORT} ssl http2;
+    server_name ${SERVER_IP};
 
-server {
-    listen 443 ssl http2;
-    server_name ${DOMAIN};
-
-    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
-    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    ssl_certificate /etc/ssl/vps-aio/selfsigned.crt;
+    ssl_certificate_key /etc/ssl/vps-aio/selfsigned.key;
 
     root /var/www/html;
     index index.html;
@@ -261,23 +225,191 @@ rm -f /etc/nginx/sites-enabled/default
 echo "<h1>It works.</h1>" > /var/www/html/index.html
 nginx -t && systemctl restart nginx
 
-echo "=== 9. Let's Encrypt certificate ==="
-certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m admin@"$DOMAIN" --redirect || \
-  echo "Certbot failed — confirm DNS A record for $DOMAIN points here, then re-run: certbot --nginx -d $DOMAIN"
+echo "=== 8. SSH reachable on 22, 80, and 443 ==="
+# 22 and 80: sshd listens on both directly (plain SSH protocol works on any port).
+# 443: shared with HTTPS via sslh, which peeks at the first bytes of each connection
+#      and routes real TLS/HTTPS traffic to Nginx (127.0.0.1:${NGINX_TLS_PORT}) and
+#      SSH-looking traffic to sshd (127.0.0.1:22). This is the standard, above-board
+#      way to reach your own server when a network only allows outbound 80/443 —
+#      it does not affect or interact with any carrier/ISP data billing.
+SSHD_CONFIG="/etc/ssh/sshd_config"
+cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
+sed -i '/^Port /d' "$SSHD_CONFIG"
+sed -i '1i Port 22\nPort 80' "$SSHD_CONFIG"
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+systemctl restart ssh || systemctl restart sshd
 
-echo "=== 10. Firewall ==="
-ufw allow OpenSSH
+cat > /etc/default/sslh <<EOF
+RUN=yes
+DAEMON_OPTS="--user sslh --listen 0.0.0.0:443 --ssh 127.0.0.1:22 --tls 127.0.0.1:${NGINX_TLS_PORT} --pidfile /var/run/sslh/sslh.pid"
+EOF
+systemctl enable sslh
+systemctl restart sslh
+
+echo "=== 9. Firewall ==="
+ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 
-echo "=== 11. Health check (ttyd + xray + nginx) ==="
+echo "=== 10. Account management menu (Xray + SSH) ==="
+mkdir -p /etc/vps-aio
+cat > /etc/vps-aio/env <<EOF
+SERVER_IP="${SERVER_IP}"
+VLESS_WS_PATH="${VLESS_WS_PATH}"
+TROJAN_WS_PATH="${TROJAN_WS_PATH}"
+EOF
+
+cat > /usr/local/bin/vps-menu <<'MENU_EOF'
+#!/usr/bin/env bash
+# Interactive menu: add/delete Xray accounts and add/delete SSH accounts.
+set -euo pipefail
+source /etc/vps-aio/env
+
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_CLIENTS="/usr/local/etc/xray/clients.json"
+
+print_xray_account() {
+  local label="$1" uuid="$2" tpw="$3"
+  echo ""
+  echo "==================== ${label} ===================="
+  echo "VLESS:"
+  echo "vless://${uuid}@${SERVER_IP}:443?encryption=none&security=tls&type=ws&host=${SERVER_IP}&path=${VLESS_WS_PATH}#${SERVER_IP}-${label}-vless"
+  echo ""
+  echo "Trojan:"
+  echo "trojan://${tpw}@${SERVER_IP}:443?security=tls&type=ws&host=${SERVER_IP}&path=${TROJAN_WS_PATH}#${SERVER_IP}-${label}-trojan"
+  echo ""
+  echo "(self-signed cert — enable \"allow insecure / skip cert verify\" in your client app)"
+  echo "===================================================="
+}
+
+xray_add() {
+  read -rp "Name for this Xray account: " LABEL
+  if [[ -z "$LABEL" ]]; then echo "Name required."; return; fi
+  if jq -e --arg l "$LABEL" '.[] | select(.label==$l)' "$XRAY_CLIENTS" >/dev/null 2>&1; then
+    echo "That name already exists. Pick another."
+    return
+  fi
+  UUID=$(cat /proc/sys/kernel/random/uuid)
+  TPW=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+
+  jq --arg id "$UUID" --arg label "$LABEL" \
+    '.inbounds[0].settings.clients += [{"id": $id, "level": 0, "email": $label}]' \
+    "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+  jq --arg pw "$TPW" --arg label "$LABEL" \
+    '.inbounds[1].settings.clients += [{"password": $pw, "email": $label}]' \
+    "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+  jq --arg label "$LABEL" --arg uuid "$UUID" --arg trojanpw "$TPW" \
+    '. + [{"label": $label, "vless_uuid": $uuid, "trojan_password": $trojanpw}]' \
+    "$XRAY_CLIENTS" > "${XRAY_CLIENTS}.tmp" && mv "${XRAY_CLIENTS}.tmp" "$XRAY_CLIENTS"
+
+  systemctl restart xray
+  echo "Xray account created — ready to copy:"
+  print_xray_account "$LABEL" "$UUID" "$TPW"
+}
+
+xray_delete() {
+  mapfile -t LABELS < <(jq -r '.[].label' "$XRAY_CLIENTS")
+  if [[ ${#LABELS[@]} -eq 0 ]]; then echo "No Xray accounts yet."; return; fi
+  echo "Xray accounts:"
+  select LABEL in "${LABELS[@]}" "Cancel"; do
+    [[ "$LABEL" == "Cancel" || -z "$LABEL" ]] && return
+    jq --arg l "$LABEL" 'del(.inbounds[0].settings.clients[] | select(.email==$l))' \
+      "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+    jq --arg l "$LABEL" 'del(.inbounds[1].settings.clients[] | select(.email==$l))' \
+      "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+    jq --arg l "$LABEL" 'map(select(.label!=$l))' \
+      "$XRAY_CLIENTS" > "${XRAY_CLIENTS}.tmp" && mv "${XRAY_CLIENTS}.tmp" "$XRAY_CLIENTS"
+    systemctl restart xray
+    echo "Deleted Xray account: $LABEL"
+    return
+  done
+}
+
+xray_list() {
+  echo ""
+  jq -c '.[]' "$XRAY_CLIENTS" | while read -r c; do
+    LABEL=$(echo "$c" | jq -r '.label')
+    UUID=$(echo "$c" | jq -r '.vless_uuid')
+    TPW=$(echo "$c" | jq -r '.trojan_password')
+    print_xray_account "$LABEL" "$UUID" "$TPW"
+  done
+}
+
+ssh_add() {
+  read -rp "SSH username: " SUSER
+  if [[ -z "$SUSER" ]]; then echo "Username required."; return; fi
+  if id "$SUSER" >/dev/null 2>&1; then
+    echo "That user already exists."
+    return
+  fi
+  read -rsp "SSH password (leave blank to auto-generate): " SPASS
+  echo ""
+  if [[ -z "$SPASS" ]]; then
+    SPASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+  fi
+  useradd -m -s /bin/false "$SUSER"
+  echo "${SUSER}:${SPASS}" | chpasswd
+  echo ""
+  echo "==================== ${SUSER} (SSH) ===================="
+  echo "Host:     ${SERVER_IP}"
+  echo "Username: ${SUSER}"
+  echo "Password: ${SPASS}"
+  echo "Ports:    22, 80, 443 (443 shares HTTPS via sslh)"
+  echo "==========================================================="
+}
+
+ssh_delete() {
+  mapfile -t SUSERS < <(awk -F: '$3>=1000 && $3<60000 {print $1}' /etc/passwd)
+  if [[ ${#SUSERS[@]} -eq 0 ]]; then echo "No SSH accounts yet."; return; fi
+  echo "SSH accounts:"
+  select SUSER in "${SUSERS[@]}" "Cancel"; do
+    [[ "$SUSER" == "Cancel" || -z "$SUSER" ]] && return
+    userdel -r "$SUSER" 2>/dev/null || userdel "$SUSER"
+    echo "Deleted SSH account: $SUSER"
+    return
+  done
+}
+
+ssh_list() {
+  echo ""
+  echo "SSH accounts (host: ${SERVER_IP}, ports 22/80/443):"
+  awk -F: '$3>=1000 && $3<60000 {print " - "$1}' /etc/passwd
+}
+
+while true; do
+  echo ""
+  echo "============ VPS Account Menu ============"
+  echo "1) Add Xray account"
+  echo "2) Delete Xray account"
+  echo "3) List Xray accounts"
+  echo "4) Add SSH account"
+  echo "5) Delete SSH account"
+  echo "6) List SSH accounts"
+  echo "7) Exit"
+  echo "============================================"
+  read -rp "Choose: " CHOICE
+  case "$CHOICE" in
+    1) xray_add ;;
+    2) xray_delete ;;
+    3) xray_list ;;
+    4) ssh_add ;;
+    5) ssh_delete ;;
+    6) ssh_list ;;
+    7) exit 0 ;;
+    *) echo "Invalid choice." ;;
+  esac
+done
+MENU_EOF
+chmod +x /usr/local/bin/vps-menu
+
+echo "=== 11. Health check (ttyd + xray + nginx + sslh) ==="
 cat > /usr/local/bin/vps-health-check.sh <<'EOF'
 #!/usr/bin/env bash
 LOG="/var/log/vps-health.log"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-for svc in xray nginx ttyd; do
+for svc in xray nginx ttyd sslh; do
   if ! systemctl is-active --quiet "$svc"; then
     echo "$(ts) WARNING: $svc is down, restarting..." >> "$LOG"
     systemctl restart "$svc"
@@ -294,7 +426,7 @@ chmod +x /usr/local/bin/vps-health-check.sh
 
 cat > /etc/systemd/system/vps-health-check.service <<'EOF'
 [Unit]
-Description=VPS health check (xray/nginx/ttyd)
+Description=VPS health check (xray/nginx/ttyd/sslh)
 
 [Service]
 Type=oneshot
@@ -318,22 +450,27 @@ systemctl enable --now vps-health-check.timer
 
 echo ""
 echo "======================================================"
-echo " DONE — everything is behind https://${DOMAIN}/ on 443"
+echo " DONE"
 echo "======================================================"
 echo ""
-echo "SSH:"
-echo "  ssh -i /path/to/your/private_key ${REAL_USER}@${DOMAIN}"
-echo "  (password login disabled, fail2ban active, 5 tries/1hr ban)"
+echo "SSH — reachable on port 22, 80, AND 443 (443 shares HTTPS via sslh):"
+echo "  ssh root@${SERVER_IP}                 (port 22, default)"
+echo "  ssh -p 80 root@${SERVER_IP}           (port 80)"
+echo "  ssh -p 443 root@${SERVER_IP}          (port 443, multiplexed with HTTPS)"
+echo ""
+echo "Manage Xray and SSH accounts (add/delete, ready-to-copy output):"
+echo "  sudo vps-menu"
 echo ""
 echo "BBR congestion control: ${CURRENT_CC}"
 echo "Health check: every 2 min -> /var/log/vps-health.log"
 echo ""
 echo "ttyd web terminal (paste into the AmberVPN page's 'host' field):"
-echo "  Terminal endpoint: ${DOMAIN}/terminal"
+echo "  Terminal endpoint: ${SERVER_IP}/terminal"
 echo "  Scheme: https"
-echo "  (i.e. full URL https://${DOMAIN}/terminal/)"
+echo "  (i.e. full URL https://${SERVER_IP}/terminal/ — browser will warn"
+echo "   about the self-signed cert; accept/proceed anyway)"
 echo ""
-echo "--- Xray client configs (also saved to /usr/local/etc/xray/clients.json) ---"
+echo "--- Initial Xray client configs (also saved to /usr/local/etc/xray/clients.json) ---"
 jq -c '.[]' /usr/local/etc/xray/clients.json | while read -r c; do
   LABEL=$(echo "$c" | jq -r '.label')
   UUID=$(echo "$c" | jq -r '.vless_uuid')
@@ -341,9 +478,12 @@ jq -c '.[]' /usr/local/etc/xray/clients.json | while read -r c; do
   echo ""
   echo "[$LABEL]"
   echo "  VLESS link:"
-  echo "    vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${DOMAIN}&path=${VLESS_WS_PATH}#${DOMAIN}-${LABEL}-vless"
+  echo "    vless://${UUID}@${SERVER_IP}:443?encryption=none&security=tls&type=ws&host=${SERVER_IP}&path=${VLESS_WS_PATH}#${SERVER_IP}-${LABEL}-vless"
   echo "  Trojan link:"
-  echo "    trojan://${TPW}@${DOMAIN}:443?security=tls&type=ws&host=${DOMAIN}&path=${TROJAN_WS_PATH}#${DOMAIN}-${LABEL}-trojan"
+  echo "    trojan://${TPW}@${SERVER_IP}:443?security=tls&type=ws&host=${SERVER_IP}&path=${TROJAN_WS_PATH}#${SERVER_IP}-${LABEL}-trojan"
+  echo "  (self-signed cert — client apps must allow \"insecure/skip cert verify\")"
 done
 echo ""
 echo "Full client data saved at: /usr/local/etc/xray/clients.json (keep private)"
+echo ""
+echo "From now on, add/delete Xray and SSH accounts anytime with: sudo vps-menu"
