@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 #
 # setup-vps-aio.sh  (All-In-One)
-# Unified personal VPS stack on Ubuntu/Debian, all sharing port 443 via Nginx:
+# Unified personal VPS stack on Ubuntu/Debian, all sharing ports 80/443 via
+# sslh + Nginx:
 #   - ttyd web terminal          -> https://SERVER_IP/terminal/  (WS)
 #   - Xray VLESS+WS+TLS          -> https://SERVER_IP/<random>/  (WS)
 #   - Xray Trojan+WS+TLS         -> https://SERVER_IP/<random>/  (WS)
-#   - SSH                        -> password auth, reachable on ports 22, 80, AND 443
-#                                    (443 is shared with HTTPS via sslh port multiplexing,
-#                                    for use when your own network blocks port 22 outbound)
+#   - SSH                        -> password auth, reachable on port 22,
+#                                    and multiplexed onto 80 + 443 via sslh
+#   - SSH-over-WebSocket         -> https://SERVER_IP/<random>/  (WS, via Nginx)
+#   - SSH-over-TLS via stunnel   -> port 80/443, selected by SNI hostname
+#   - HTTP CONNECT proxy         -> port 80/443, auto-detected by sslh, needs login
 #   - BBR congestion control
-#   - systemd timer health check for xray/nginx/ttyd/sslh
+#   - systemd timer health check for xray/nginx/ttyd/sslh/ssh-ws/stunnel4/tinyproxy
 #   - amber: interactive menu to add/delete Xray and SSH accounts
+#
+# sslh listens on 0.0.0.0:80 and 0.0.0.0:443 and inspects each new connection:
+#   - looks like SSH?               -> 127.0.0.1:22 (sshd)
+#   - TLS, SNI matches stunnel host -> 127.0.0.1:${STUNNEL_PORT} (stunnel -> sshd)
+#   - looks like plain HTTP/CONNECT -> 127.0.0.1:${PROXY_PORT} (tinyproxy)
+#   - any other TLS                 -> 127.0.0.1:${NGINX_TLS_PORT} (Nginx: ttyd/Xray/SSH-WS)
 #
 # No domain needed. TLS is a self-signed certificate issued for this
 # VPS's public IP address (clients will need to accept/trust it manually,
@@ -46,13 +55,20 @@ echo "Detected public IP: ${SERVER_IP}"
 
 VLESS_WS_PATH="/$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
 TROJAN_WS_PATH="/$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
+SSH_WS_PATH="/$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
 TTYD_PORT=7681
 NGINX_TLS_PORT=8443   # internal only — sslh sits in front of public 443
+WEBSOCAT_PORT=10002   # internal only — SSH-over-WebSocket bridge for Nginx
+STUNNEL_PORT=10003    # internal only — stunnel terminates TLS, forwards to sshd
+PROXY_PORT=8888       # internal only — tinyproxy HTTP CONNECT proxy
+STUNNEL_SNI="$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 8).local"
+PROXY_USER="user$(set +o pipefail; tr -dc 'a-z0-9' </dev/urandom | head -c 4)"
+PROXY_PASS=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
 
 echo "=== 1. Updating system ==="
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y curl wget unzip nginx openssl ufw jq sslh build-essential
+apt-get install -y curl wget unzip nginx openssl ufw jq sslh build-essential stunnel4 tinyproxy
 
 echo "=== 2. Installing ttyd ==="
 if ! command -v ttyd >/dev/null 2>&1; then
@@ -88,6 +104,55 @@ EOF
 systemctl daemon-reload
 systemctl enable ttyd
 systemctl restart ttyd
+
+echo "=== 2b. Installing websocat (SSH-over-WebSocket bridge) ==="
+if ! command -v websocat >/dev/null 2>&1; then
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64) WS_BIN="websocat.x86_64-unknown-linux-musl" ;;
+    aarch64) WS_BIN="websocat.aarch64-unknown-linux-musl" ;;
+    *) echo "Unsupported architecture for websocat: $ARCH"; exit 1 ;;
+  esac
+  curl -fsSL -o /usr/local/bin/websocat \
+    "https://github.com/vi/websocat/releases/latest/download/${WS_BIN}"
+  chmod +x /usr/local/bin/websocat
+fi
+
+cat > /etc/systemd/system/ssh-ws.service <<EOF
+[Unit]
+Description=SSH-over-WebSocket bridge (websocat -> local sshd)
+After=network.target ssh.service
+
+[Service]
+# Bound to localhost only — Nginx proxies it externally over TLS, same as Xray.
+ExecStart=/usr/local/bin/websocat -b ws-listen:127.0.0.1:${WEBSOCAT_PORT} tcp:127.0.0.1:22
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable ssh-ws
+systemctl restart ssh-ws
+
+echo "=== 2c. Configuring tinyproxy (HTTP proxy, multiplexed on 80/443 via sslh) ==="
+cat > /etc/tinyproxy/tinyproxy.conf <<EOF
+User tinyproxy
+Group tinyproxy
+Port ${PROXY_PORT}
+Listen 127.0.0.1
+Timeout 600
+DisableViaHeader Yes
+LogLevel Warning
+PidFile "/run/tinyproxy/tinyproxy.pid"
+BasicAuth ${PROXY_USER} ${PROXY_PASS}
+Allow 127.0.0.1
+EOF
+systemctl enable tinyproxy
+systemctl restart tinyproxy
 
 echo "=== 3. BBR congestion control ==="
 cat >> /etc/sysctl.conf <<'EOF2'
@@ -174,6 +239,22 @@ openssl req -x509 -nodes -newkey rsa:2048 \
   -addext "subjectAltName=IP:${SERVER_IP}"
 chmod 600 /etc/ssl/vps-aio/selfsigned.key
 
+echo "=== 6b. Configuring stunnel (SSH-over-TLS, multiplexed via SNI on 80/443) ==="
+mkdir -p /var/log/stunnel4
+cat > /etc/stunnel/ssh-tls.conf <<EOF
+pid = /var/run/stunnel4/ssh-tls.pid
+output = /var/log/stunnel4/ssh-tls.log
+
+[ssh-tls]
+accept = 127.0.0.1:${STUNNEL_PORT}
+connect = 127.0.0.1:22
+cert = /etc/ssl/vps-aio/selfsigned.crt
+key = /etc/ssl/vps-aio/selfsigned.key
+EOF
+sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || echo "ENABLED=1" >> /etc/default/stunnel4
+systemctl enable stunnel4
+systemctl restart stunnel4
+
 echo "=== 7. Nginx (internal TLS on 127.0.0.1:${NGINX_TLS_PORT} — sslh fronts public 443) ==="
 cat > /etc/nginx/sites-available/vps-aio <<EOF
 server {
@@ -217,6 +298,17 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
     }
+
+    # SSH-over-WebSocket (same pattern as Xray above)
+    location ${SSH_WS_PATH} {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:${WEBSOCAT_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
 }
 EOF
 
@@ -229,13 +321,36 @@ echo "=== 8. SSH reachable on 22, 80, and 443 ==="
 SSHD_CONFIG="/etc/ssh/sshd_config"
 cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
 sed -i '/^Port /d' "$SSHD_CONFIG"
-sed -i '1i Port 22\nPort 80' "$SSHD_CONFIG"
+sed -i '1i Port 22' "$SSHD_CONFIG"
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONFIG"
 systemctl restart ssh || systemctl restart sshd
 
+echo "=== 8b. sslh — multiplexing ssh / nginx-tls / stunnel-tls / http-proxy on 80 AND 443 ==="
+mkdir -p /etc/sslh
+cat > /etc/sslh/sslh.cfg <<EOF
+user = "sslh";
+pidfile = "/var/run/sslh/sslh.pid";
+
+listen:
+(
+  { host: "0.0.0.0"; port: "443"; },
+  { host: "0.0.0.0"; port: "80"; }
+);
+
+protocols:
+(
+  { name: "ssh"; host: "127.0.0.1"; port: "22"; },
+  { name: "tls"; host: "127.0.0.1"; port: "${STUNNEL_PORT}"; sni_hostnames: [ "${STUNNEL_SNI}" ]; },
+  { name: "http"; host: "127.0.0.1"; port: "${PROXY_PORT}"; },
+  { name: "tls"; host: "127.0.0.1"; port: "${NGINX_TLS_PORT}"; }
+);
+EOF
+# NOTE: sni_hostnames routing needs sslh >= 1.20 built with libconfig+OpenSSL
+# (stock on Ubuntu 22.04/24.04). If `systemctl status sslh` shows a config
+# parse error, run `sslh -v` to confirm SNI support, or drop the stunnel
+# "tls" entry above and reach stunnel on its own port instead.
 cat > /etc/default/sslh <<EOF
 RUN=yes
-DAEMON_OPTS="--user sslh --listen 0.0.0.0:443 --ssh 127.0.0.1:22 --tls 127.0.0.1:${NGINX_TLS_PORT} --pidfile /var/run/sslh/sslh.pid"
 EOF
 systemctl enable sslh
 systemctl restart sslh
@@ -252,6 +367,10 @@ cat > /etc/vps-aio/env <<EOF
 SERVER_IP="${SERVER_IP}"
 VLESS_WS_PATH="${VLESS_WS_PATH}"
 TROJAN_WS_PATH="${TROJAN_WS_PATH}"
+SSH_WS_PATH="${SSH_WS_PATH}"
+STUNNEL_SNI="${STUNNEL_SNI}"
+PROXY_USER="${PROXY_USER}"
+PROXY_PASS="${PROXY_PASS}"
 EOF
 
 cat > /usr/local/bin/amber <<'MENU_EOF'
@@ -353,6 +472,24 @@ ssh_add() {
   echo "Password: ${SPASS}"
   echo "Ports:    22, 80, 443 (443 shares HTTPS via sslh)"
   echo ""
+  echo "SSH-over-WebSocket (looks like normal HTTPS, same style as Xray):"
+  echo "  Host/Address: ${SERVER_IP}"
+  echo "  Port:         443"
+  echo "  Path:         ${SSH_WS_PATH}"
+  echo "  TLS:          yes (self-signed — client must allow insecure/skip verify)"
+  echo "  (use with a WS-capable SSH tunnel client, e.g. wstunnel or an app's"
+  echo "   'SSH-WS' / 'SSH over Websocket' mode — not plain 'ssh' on its own)"
+  echo ""
+  echo "SSH-over-TLS via stunnel (for apps' 'SSH-TLS'/'stunnel' payload mode):"
+  echo "  Host/Address: ${SERVER_IP}   Port: 443 (or 80)"
+  echo "  SNI / TLS hostname to set in the app: ${STUNNEL_SNI}"
+  echo "  (self-signed cert — allow insecure/skip verify)"
+  echo ""
+  echo "HTTP proxy (CONNECT), also multiplexed on 80/443:"
+  echo "  Host/Address: ${SERVER_IP}   Port: 80 or 443"
+  echo "  Username: ${PROXY_USER}"
+  echo "  Password: ${PROXY_PASS}"
+  echo ""
   echo "Web terminal (same login): https://${SERVER_IP}/terminal/"
   echo "  (browser will warn on the self-signed cert — accept/proceed anyway)"
   echo ""
@@ -452,7 +589,7 @@ cat > /usr/local/bin/vps-health-check.sh <<'EOF3'
 LOG="/var/log/vps-health.log"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-for svc in xray nginx ttyd sslh; do
+for svc in xray nginx ttyd sslh ssh-ws stunnel4 tinyproxy; do
   if ! systemctl is-active --quiet "$svc"; then
     echo "$(ts) WARNING: $svc is down, restarting..." >> "$LOG"
     systemctl restart "$svc"
@@ -500,6 +637,20 @@ echo "SSH — reachable on port 22, 80, AND 443 (443 shares HTTPS via sslh):"
 echo "  ssh root@${SERVER_IP}                 (port 22, default)"
 echo "  ssh -p 80 root@${SERVER_IP}           (port 80)"
 echo "  ssh -p 443 root@${SERVER_IP}          (port 443, multiplexed with HTTPS)"
+echo ""
+echo "SSH-over-WebSocket (bonus, same style as Xray VLESS/Trojan above):"
+echo "  Address: ${SERVER_IP}   Port: 443   Path: ${SSH_WS_PATH}   TLS: yes"
+echo "  (self-signed cert — client must allow insecure/skip cert verify)"
+echo "  Needs a WS-aware SSH tunnel client (e.g. wstunnel) pointed at that"
+echo "  path — plain 'ssh' commands still just use the ports listed above."
+echo ""
+echo "SSH-over-TLS via stunnel (bonus — for 'SSH-TLS' payload mode in apps):"
+echo "  Address: ${SERVER_IP}   Port: 443 or 80   SNI: ${STUNNEL_SNI}"
+echo "  (self-signed cert — allow insecure/skip verify)"
+echo ""
+echo "HTTP proxy (bonus — CONNECT proxy, also on 80/443, needs login):"
+echo "  Address: ${SERVER_IP}   Port: 80 or 443"
+echo "  Username: ${PROXY_USER}   Password: ${PROXY_PASS}"
 echo ""
 echo "Manage Xray and SSH accounts (add/delete, ready-to-copy output):"
 echo "  sudo amber"
