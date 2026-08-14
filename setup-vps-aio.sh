@@ -115,13 +115,13 @@ for i in $(seq 1 "$NUM_CLIENTS"); do
   TROJAN_PW=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
   LABEL="device${i}"
 
-  VLESS_CLIENTS_JSON=$(echo "$VLESS_CLIENTS_JSON" | jq --arg id "$UUID" --arg label "$LABEL" \
-    '. + [{"id": $id, "level": 0, "email": $label}]')
-  TROJAN_CLIENTS_JSON=$(echo "$TROJAN_CLIENTS_JSON" | jq --arg pw "$TROJAN_PW" --arg label "$LABEL" \
-    '. + [{"password": $pw, "email": $label}]')
+  VLESS_CLIENTS_JSON=$(echo "$VLESS_CLIENTS_JSON" | jq --arg id "$UUID" --arg lbl "$LABEL" \
+    '. + [{"id": $id, "level": 0, "email": $lbl}]')
+  TROJAN_CLIENTS_JSON=$(echo "$TROJAN_CLIENTS_JSON" | jq --arg pw "$TROJAN_PW" --arg lbl "$LABEL" \
+    '. + [{"password": $pw, "email": $lbl}]')
 
-  jq --arg label "$LABEL" --arg uuid "$UUID" --arg trojanpw "$TROJAN_PW" \
-    '. + [{"label": $label, "vless_uuid": $uuid, "trojan_password": $trojanpw}]' \
+  jq --arg lbl "$LABEL" --arg uuid "$UUID" --arg trojanpw "$TROJAN_PW" \
+    '. + [{"label": $lbl, "vless_uuid": $uuid, "trojan_password": $trojanpw}]' \
     "$CLIENTS_FILE" > "${CLIENTS_FILE}.tmp" && mv "${CLIENTS_FILE}.tmp" "$CLIENTS_FILE"
 done
 
@@ -286,14 +286,14 @@ xray_add() {
   UUID=$(cat /proc/sys/kernel/random/uuid)
   TPW=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
 
-  jq --arg id "$UUID" --arg label "$LABEL" \
-    '.inbounds[0].settings.clients += [{"id": $id, "level": 0, "email": $label}]' \
+  jq --arg id "$UUID" --arg lbl "$LABEL" \
+    '.inbounds[0].settings.clients += [{"id": $id, "level": 0, "email": $lbl}]' \
     "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-  jq --arg pw "$TPW" --arg label "$LABEL" \
-    '.inbounds[1].settings.clients += [{"password": $pw, "email": $label}]' \
+  jq --arg pw "$TPW" --arg lbl "$LABEL" \
+    '.inbounds[1].settings.clients += [{"password": $pw, "email": $lbl}]' \
     "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
-  jq --arg label "$LABEL" --arg uuid "$UUID" --arg trojanpw "$TPW" \
-    '. + [{"label": $label, "vless_uuid": $uuid, "trojan_password": $trojanpw}]' \
+  jq --arg lbl "$LABEL" --arg uuid "$UUID" --arg trojanpw "$TPW" \
+    '. + [{"label": $lbl, "vless_uuid": $uuid, "trojan_password": $trojanpw}]' \
     "$XRAY_CLIENTS" > "${XRAY_CLIENTS}.tmp" && mv "${XRAY_CLIENTS}.tmp" "$XRAY_CLIENTS"
 
   systemctl restart xray
