@@ -10,7 +10,7 @@
 #                                    for use when your own network blocks port 22 outbound)
 #   - BBR congestion control
 #   - systemd timer health check for xray/nginx/ttyd/sslh
-#   - vps-menu: interactive menu to add/delete Xray and SSH accounts
+#   - amber: interactive menu to add/delete Xray and SSH accounts
 #
 # No domain needed. TLS is a self-signed certificate issued for this
 # VPS's public IP address (clients will need to accept/trust it manually,
@@ -20,7 +20,7 @@
 #   sudo bash setup-vps-aio.sh [num_initial_xray_clients]
 #
 # After setup, manage accounts anytime with:
-#   sudo vps-menu
+#   sudo amber
 #
 
 set -euo pipefail
@@ -254,7 +254,7 @@ VLESS_WS_PATH="${VLESS_WS_PATH}"
 TROJAN_WS_PATH="${TROJAN_WS_PATH}"
 EOF
 
-cat > /usr/local/bin/vps-menu <<'MENU_EOF'
+cat > /usr/local/bin/amber <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/vps-aio/env
@@ -341,14 +341,27 @@ ssh_add() {
   if [[ -z "$SPASS" ]]; then
     SPASS=$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
   fi
-  useradd -m -s /bin/false "$SUSER"
+  useradd -m -s /bin/bash "$SUSER"
   echo "${SUSER}:${SPASS}" | chpasswd
+  chmod 700 "/home/${SUSER}"
+  EXPIRE_DATE=$(date -d "+3 days" +%Y-%m-%d)
+  chage -E "$EXPIRE_DATE" "$SUSER"
   echo ""
   echo "==================== ${SUSER} (SSH) ===================="
   echo "Host:     ${SERVER_IP}"
   echo "Username: ${SUSER}"
   echo "Password: ${SPASS}"
   echo "Ports:    22, 80, 443 (443 shares HTTPS via sslh)"
+  echo ""
+  echo "Web terminal (same login): https://${SERVER_IP}/terminal/"
+  echo "  (browser will warn on the self-signed cert — accept/proceed anyway)"
+  echo ""
+  echo "This account has a normal (non-root) shell, own private home"
+  echo "directory, and no sudo access."
+  echo "Expires: ${EXPIRE_DATE} (auto-disabled after 3 days)"
+  echo ""
+  echo "Tell this user: after logging in (SSH or web terminal), type 'menu'"
+  echo "to see their own account info, expiry date, and change their password."
   echo "==========================================================="
 }
 
@@ -394,9 +407,46 @@ while true; do
   esac
 done
 MENU_EOF
-chmod +x /usr/local/bin/vps-menu
+chmod +x /usr/local/bin/amber
 
-echo "=== 11. Health check (ttyd + xray + nginx + sslh) ==="
+echo "=== 10b. Customer self-service 'menu' command ==="
+cat > /usr/local/bin/menu <<'USERMENU_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/vps-aio/env
+
+ME="$(id -un)"
+
+if [[ "$ME" == "root" ]]; then
+  echo "You're logged in as root — use 'amber' for the full admin menu."
+  exit 0
+fi
+
+EXP_LINE=$(chage -l "$ME" 2>/dev/null | grep -i "Account expires" || true)
+EXP_DATE=$(echo "$EXP_LINE" | cut -d: -f2 | sed 's/^[[:space:]]*//')
+
+while true; do
+  echo ""
+  echo "==================== My Account ===================="
+  echo "Host:            ${SERVER_IP}"
+  echo "Username:        ${ME}"
+  echo "Ports:           22, 80, 443 (443 shares HTTPS)"
+  echo "Account expires: ${EXP_DATE:-never}"
+  echo "======================================================="
+  echo ""
+  echo "1) Change my password"
+  echo "2) Exit"
+  read -rp "Choose: " CHOICE
+  case "$CHOICE" in
+    1) passwd ;;
+    2) exit 0 ;;
+    *) echo "Invalid choice." ;;
+  esac
+done
+USERMENU_EOF
+chmod 755 /usr/local/bin/menu
+
+
 cat > /usr/local/bin/vps-health-check.sh <<'EOF3'
 #!/usr/bin/env bash
 LOG="/var/log/vps-health.log"
@@ -452,7 +502,7 @@ echo "  ssh -p 80 root@${SERVER_IP}           (port 80)"
 echo "  ssh -p 443 root@${SERVER_IP}          (port 443, multiplexed with HTTPS)"
 echo ""
 echo "Manage Xray and SSH accounts (add/delete, ready-to-copy output):"
-echo "  sudo vps-menu"
+echo "  sudo amber"
 echo ""
 echo "BBR congestion control: ${CURRENT_CC}"
 echo "Health check: every 2 min -> /var/log/vps-health.log"
@@ -479,4 +529,4 @@ done
 echo ""
 echo "Full client data saved at: /usr/local/etc/xray/clients.json (keep private)"
 echo ""
-echo "From now on, add/delete Xray and SSH accounts anytime with: sudo vps-menu"
+echo "From now on, add/delete Xray and SSH accounts anytime with: sudo amber"
