@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AmberVPN | VPS Terminal</title>
+<style>
+  :root{
+    --bg:#0b0f14;
+    --panel:#111820;
+    --accent:#00c853;
+    --accent2:#ffd600;
+    --text:#e6edf3;
+    --muted:#8b98a5;
+    --danger:#ff5252;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:'Segoe UI',Roboto,Arial,sans-serif;
+    background:radial-gradient(circle at top, #16202a 0%, #0b0f14 70%);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+  }
+  header{
+    padding:16px 20px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    border-bottom:1px solid #1c2733;
+    background:rgba(17,24,32,0.8);
+  }
+  header .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px;}
+  header .status{margin-left:auto;font-size:12px;color:var(--muted);}
+
+  #login-screen{
+    flex:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:24px;
+  }
+  .card{
+    background:var(--panel);
+    border:1px solid #1c2733;
+    border-radius:14px;
+    padding:28px 24px;
+    width:100%;
+    max-width:380px;
+    box-shadow:0 10px 40px rgba(0,0,0,.4);
+  }
+  .card h2{margin:0 0 4px;font-size:18px;}
+  .card p.sub{margin:0 0 20px;color:var(--muted);font-size:13px;}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;margin-top:14px;}
+  input[type=text],input[type=password],input[type=number]{
+    width:100%;
+    padding:11px 12px;
+    border-radius:8px;
+    border:1px solid #23303d;
+    background:#0c131a;
+    color:var(--text);
+    font-size:14px;
+    outline:none;
+  }
+  input:focus{border-color:var(--accent);}
+  button{
+    width:100%;
+    margin-top:22px;
+    padding:12px;
+    border:none;
+    border-radius:8px;
+    background:var(--accent);
+    color:#04170c;
+    font-weight:700;
+    font-size:14px;
+    cursor:pointer;
+  }
+  button:active{transform:scale(0.98);}
+  .hint{margin-top:14px;font-size:11px;color:var(--muted);text-align:center;}
+  .err{color:var(--danger);font-size:12px;margin-top:10px;display:none;}
+
+  #term-screen{
+    flex:1;
+    display:none;
+    flex-direction:column;
+  }
+  #term-toolbar{
+    display:flex;
+    gap:10px;
+    padding:8px 14px;
+    background:#0c131a;
+    border-bottom:1px solid #1c2733;
+    font-size:12px;
+    color:var(--muted);
+    align-items:center;
+  }
+  #term-toolbar button{
+    width:auto;
+    margin:0;
+    padding:6px 12px;
+    background:#1c2733;
+    color:var(--text);
+    font-weight:600;
+    font-size:12px;
+  }
+  #term-frame{
+    flex:1;
+    border:none;
+    width:100%;
+    background:#000;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot"></div>
+  <h1>AmberVPN &middot; VPS Terminal</h1>
+  <div class="status" id="statusText">not connected</div>
+</header>
+
+<div id="login-screen">
+  <div class="card">
+    <h2>Connect to your VPS</h2>
+    <p class="sub">Web-based terminal powered by ttyd. Runs entirely on your own server.</p>
+
+    <label for="host">Terminal endpoint (host:port)</label>
+    <input type="text" id="host" placeholder="e.g. ambersvpn.shop:7681" value="">
+
+    <label for="useTls">Connection</label>
+    <input type="text" id="useTls" placeholder="https or http" value="https">
+
+    <button id="connectBtn">Open Terminal</button>
+    <div class="err" id="errBox">Please enter a valid host:port.</div>
+    <div class="hint">Your VPS asks for the SSH username/password itself, inside the terminal — this page does not store or see your credentials.</div>
+  </div>
+</div>
+
+<div id="term-screen">
+  <div id="term-toolbar">
+    <button id="backBtn">&larr; Disconnect</button>
+    <span id="endpointLabel"></span>
+  </div>
+  <iframe id="term-frame"></iframe>
+</div>
+
+<script>
+  const loginScreen = document.getElementById('login-screen');
+  const termScreen = document.getElementById('term-screen');
+  const hostInput = document.getElementById('host');
+  const schemeInput = document.getElementById('useTls');
+  const connectBtn = document.getElementById('connectBtn');
+  const backBtn = document.getElementById('backBtn');
+  const termFrame = document.getElementById('term-frame');
+  const statusText = document.getElementById('statusText');
+  const errBox = document.getElementById('errBox');
+  const endpointLabel = document.getElementById('endpointLabel');
+
+  // Prefill with the VPS's ttyd endpoint.
+  hostInput.value = 'terminal.ambersvpn.shop:7681';
+
+  connectBtn.addEventListener('click', () => {
+    const host = hostInput.value.trim();
+    const scheme = (schemeInput.value.trim() || 'https').replace(/[^a-z]/gi, '');
+    if (!host) {
+      errBox.style.display = 'block';
+      return;
+    }
+    errBox.style.display = 'none';
+    const url = scheme + '://' + host + '/';
+    termFrame.src = url;
+    endpointLabel.textContent = url;
+    statusText.textContent = 'connected to ' + host;
+    loginScreen.style.display = 'none';
+    termScreen.style.display = 'flex';
+  });
+
+  backBtn.addEventListener('click', () => {
+    termFrame.src = 'about:blank';
+    statusText.textContent = 'not connected';
+    termScreen.style.display = 'none';
+    loginScreen.style.display = 'flex';
+  });
+
+  hostInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') connectBtn.click();
+  });
+</script>
+
+</body>
+</html>
