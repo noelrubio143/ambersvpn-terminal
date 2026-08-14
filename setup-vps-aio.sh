@@ -351,6 +351,7 @@ EOF
 # "tls" entry above and reach stunnel on its own port instead.
 cat > /etc/default/sslh <<EOF
 RUN=yes
+DAEMON_OPTS="-F /etc/sslh/sslh.cfg"
 EOF
 systemctl enable sslh
 systemctl restart sslh
